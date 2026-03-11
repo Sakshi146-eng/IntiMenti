@@ -1,0 +1,52 @@
+# Dependencies
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+.eggs/
+
+# Virtual environments
+.env.local
+venv/
+env/
+.venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Docker
+docker-compose.override.yml
+
+# Logs
+logs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets (keep .env tracked if needed, but NOT API keys in production)
+# .env
+
+# Redis/PostgreSQL data (Docker volumes, not local)
+data/
+
+# Ollama models (managed by Docker volume)
+ollama-models/
+
+# Misc
+*.bak
+*.tmp
+
+app/test_parallel.py
