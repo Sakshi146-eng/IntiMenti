@@ -50,3 +50,5 @@ ollama-models/
 *.tmp
 
 app/test_parallel.py
+
+init-db.sql

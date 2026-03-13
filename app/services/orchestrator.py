@@ -2,15 +2,15 @@ import uuid
 from typing import List, Optional, Dict
 import asyncio
 from datetime import datetime, timedelta
-from models import (
+from database.models import (
     InterviewSession, InterviewSessionCreate, RecruiterCommand,
     InterviewStatus, SystemStats
 )
-from database import redis_client, postgres_client
-from rabbitmq import rabbitmq_client
-from interview_pod import InterviewPod
-from exceptions import SessionNotFoundError, PodNotFoundError
-from config import settings
+from database.database import redis_client, postgres_client
+from messaging.rabbitmq import rabbitmq_client
+from services.interview_pod import InterviewPod
+from core.exceptions import SessionNotFoundError, PodNotFoundError
+from core.config import settings
 import logging
 import time
 

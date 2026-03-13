@@ -4,16 +4,16 @@ import uuid
 from datetime import datetime, timedelta
 import psutil
 import time
-from models import (
+from database.models import (
     InterviewSession, Message, MessageRole, Score,
     RecruiterCommand, CommandType, InterviewStatus
 )
-from database import redis_client, postgres_client
-from rabbitmq import rabbitmq_client
-from openai_client import openai_client
-from exceptions import InterviewTimeoutError, PodAtCapacityError
+from database.database import redis_client, postgres_client
+from messaging.rabbitmq import rabbitmq_client
+from integrations.openai_client import openai_client
+from core.exceptions import InterviewTimeoutError, PodAtCapacityError
 from utils import Timer, InterviewMetrics
-from config import settings
+from core.config import settings
 import logging
 
 logger = logging.getLogger(__name__)
@@ -34,6 +34,14 @@ class InterviewAgent:
         self.metrics = InterviewMetrics()
         self.previous_scores = []
         self.timeout_at = datetime.utcnow() + timedelta(minutes=settings.INTERVIEW_TIMEOUT_MINUTES)
+        
+        # ── asyncio.Event signals (in-process, zero-cost, instant) ──
+        # Both the wait loops and process_recruiter_command run in the
+        # same event loop, so we use Events instead of Redis polling.
+        self._score_received = asyncio.Event()
+        self._decision_received = asyncio.Event()
+        self._pending_decision: dict = {}   # set by process_recruiter_command
+        self._pod: "InterviewPod | None" = None  # back-reference for cleanup on end
     
     async def start(self):
         """Start the interview process"""
@@ -211,81 +219,113 @@ class InterviewAgent:
             "timestamp": datetime.utcnow().isoformat()
         })
         
-        # Wait for recruiter decision if needed (with timeout)
-        if evaluation.get("should_ask_followup"):
+        # Always wait for recruiter score/feedback (every question)
+        await self.wait_for_recruiter_score()
+        
+        # After the first 3 fixed questions, wait for recruiter decision (buttons)
+        fixed_count = len(self.session.initial_questions or [])
+        if self.question_count > fixed_count:
+            # Q4+ — wait for recruiter decision (accept followup / custom / end)
             await self.wait_for_recruiter_decision()
         else:
-            # Ask next question
+            # Q1-Q3 — auto-proceed to next question after score
             await self.ask_next_question()
     
+    async def wait_for_recruiter_score(self):
+        """Block until recruiter submits /score, or timeout fires.
+        Uses asyncio.Event — zero Redis reads, wakes instantly when score arrives."""
+        self._score_received.clear()
+        logger.info(
+            f"Interview {self.session.id} - Waiting for recruiter score "
+            f"(timeout {settings.RECRUITER_SCORE_TIMEOUT}s)"
+        )
+        try:
+            await asyncio.wait_for(
+                self._score_received.wait(),
+                timeout=settings.RECRUITER_SCORE_TIMEOUT
+            )
+            logger.info(f"Interview {self.session.id} - Recruiter score received")
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Interview {self.session.id} - Recruiter score timeout after "
+                f"{settings.RECRUITER_SCORE_TIMEOUT}s, proceeding"
+            )
+    
     async def wait_for_recruiter_decision(self):
-        """Wait for recruiter decision with timeout"""
-        timeout = 120  # 120 seconds timeout
-        start_time = time.time()
+        """Block until recruiter makes a decision (accept/custom/end), or timeout.
+        Uses asyncio.Event — wakes instantly when recruiter acts."""
+        self._decision_received.clear()
+        self._pending_decision = {}
+        logger.info(
+            f"Interview {self.session.id} - Waiting for recruiter decision "
+            f"(timeout {settings.RECRUITER_DECISION_TIMEOUT}s)"
+        )
+        try:
+            await asyncio.wait_for(
+                self._decision_received.wait(),
+                timeout=settings.RECRUITER_DECISION_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Interview {self.session.id} - Recruiter decision timeout, "
+                "auto-proceeding to next question"
+            )
+            await self.ask_next_question()
+            return
         
-        while self.running and (time.time() - start_time) < timeout:
-            # Check if recruiter made a decision
-            pending = await redis_client.get_pending_action(self.session.id)
-            if pending and pending.get("recruiter_decision"):
-                decision = pending["recruiter_decision"]
-                
-                if decision == "accept" and pending.get("suggestion"):
-                    # Ask suggested follow-up
-                    followup_msg = Message(
-                        id=str(uuid.uuid4()),
-                        role=MessageRole.AI,
-                        content=pending["suggestion"],
-                        metadata={
-                            "is_followup": True,
-                            "recruiter_approved": True,
-                            "timestamp": datetime.utcnow().isoformat()
-                        }
-                    )
-                    
-                    self.session.conversation_history.append(followup_msg)
-                    self.session.current_question = pending["suggestion"]
-                    await redis_client.update_session(self.session)
-                    
-                    logger.info(f"Interview {self.session.id} - Asked approved follow-up")
-                    
-                elif decision == "custom" and pending.get("custom_question"):
-                    # Ask custom question
-                    custom_msg = Message(
-                        id=str(uuid.uuid4()),
-                        role=MessageRole.AI,
-                        content=pending["custom_question"],
-                        metadata={
-                            "is_followup": True,
-                            "custom": True,
-                            "recruiter_question": True,
-                            "timestamp": datetime.utcnow().isoformat()
-                        }
-                    )
-                    
-                    self.session.conversation_history.append(custom_msg)
-                    self.session.current_question = pending["custom_question"]
-                    await redis_client.update_session(self.session)
-                    
-                    logger.info(f"Interview {self.session.id} - Asked custom recruiter question")
-                
-                # Clear pending action
-                await redis_client.clear_pending_action(self.session.id)
-                
-                # Wait for response to follow-up
-                # In production, this would wait for actual candidate response
-                # For now, we'll simulate with a delay
-                await asyncio.sleep(2)
-                
-                # After follow-up, ask next question
-                await self.ask_next_question()
-                return
-            
-            await asyncio.sleep(1)
+        # Act on what recruiter decided
+        await self._execute_decision()
+    
+    async def _execute_decision(self):
+        """Execute the recruiter's decision stored in self._pending_decision."""
+        decision = self._pending_decision.get("type", "")
         
-        # Timeout - continue without follow-up
-        logger.info(f"Interview {self.session.id} - Recruiter decision timeout")
-        await redis_client.clear_pending_action(self.session.id)
-        await self.ask_next_question()
+        if decision == "end":
+            # end_interview already spawned as background task by process_recruiter_command
+            logger.info(f"Interview {self.session.id} - Executing end decision")
+            return
+        
+        elif decision == "accept":
+            suggestion = self._pending_decision.get("suggestion", "")
+            if suggestion:
+                followup_msg = Message(
+                    id=str(uuid.uuid4()),
+                    role=MessageRole.AI,
+                    content=suggestion,
+                    metadata={
+                        "is_followup": True,
+                        "recruiter_approved": True,
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                )
+                self.session.conversation_history.append(followup_msg)
+                self.session.current_question = suggestion
+                await redis_client.update_session(self.session)
+                logger.info(f"Interview {self.session.id} - Asked approved followup")
+        
+        elif decision == "custom":
+            custom_q = self._pending_decision.get("question", "")
+            if custom_q:
+                custom_msg = Message(
+                    id=str(uuid.uuid4()),
+                    role=MessageRole.AI,
+                    content=custom_q,
+                    metadata={
+                        "is_followup": True,
+                        "custom": True,
+                        "recruiter_question": True,
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                )
+                self.session.conversation_history.append(custom_msg)
+                self.session.current_question = custom_q
+                await redis_client.update_session(self.session)
+                logger.info(f"Interview {self.session.id} - Asked custom recruiter question")
+        
+        # After followup question is set, ask next question
+        if decision in ("accept", "custom"):
+            await asyncio.sleep(1)   # brief pause before continuing
+            await self.ask_next_question()
     
     async def process_recruiter_command(self, command: RecruiterCommand):
         """Process command from recruiter"""
@@ -299,39 +339,50 @@ class InterviewAgent:
             command.data or {}
         )
         
-        # Store recruiter score/feedback if provided
-        if command.recruiter_score is not None and self.session.scores:
-            latest_score = self.session.scores[-1]
-            latest_score.recruiter_score = command.recruiter_score
-            logger.info(f"Recruiter scored {command.recruiter_score}/10 for session {self.session.id}")
-        
-        if command.recruiter_feedback and self.session.scores:
-            latest_score = self.session.scores[-1]
-            latest_score.feedback = command.recruiter_feedback
-            logger.info(f"Recruiter feedback added for session {self.session.id}")
-        
         if command.type == CommandType.ACCEPT_FOLLOWUP:
-            # Accept suggested follow-up
+            # Retrieve suggestion from pending action (still write pending to Redis for logging)
             pending = await redis_client.get_pending_action(self.session.id)
-            if pending:
-                pending["recruiter_decision"] = "accept"
-                await redis_client.set_pending_action(self.session.id, pending)
-                logger.info(f"Recruiter accepted follow-up for session {self.session.id}")
+            suggestion = pending.get("suggestion", "") if pending else ""
+            self._pending_decision = {"type": "accept", "suggestion": suggestion}
+            self._decision_received.set()    # ← wakes wait_for_recruiter_decision instantly
+            logger.info(f"Recruiter accepted follow-up for session {self.session.id}")
                 
         elif command.type == CommandType.CUSTOM_FOLLOWUP:
-            # Use custom question
-            pending = await redis_client.get_pending_action(self.session.id)
-            if pending:
-                pending["recruiter_decision"] = "custom"
-                pending["custom_question"] = command.data.get("question")
-                await redis_client.set_pending_action(self.session.id, pending)
-                logger.info(f"Recruiter sent custom question for session {self.session.id}")
+            self._pending_decision = {
+                "type": "custom",
+                "question": (command.data or {}).get("question", "")
+            }
+            self._decision_received.set()    # ← wakes wait_for_recruiter_decision instantly
+            logger.info(f"Recruiter sent custom question for session {self.session.id}")
+        
+        elif command.type == CommandType.SCORE_SUBMITTED:
+            # Store score in session + Redis, then fire score event
+            if command.recruiter_score is not None and self.session.scores:
+                latest = self.session.scores[-1]
+                latest.recruiter_score = command.recruiter_score
+                if command.recruiter_feedback:
+                    latest.feedback = command.recruiter_feedback
+                await redis_client.update_session(self.session)
+                await postgres_client.log_interview(self.session)
+                logger.info(
+                    f"Recruiter score {command.recruiter_score}/10 recorded "
+                    f"for session {self.session.id}"
+                )
+            elif not self.session.scores:
+                logger.warning(
+                    f"Recruiter tried to score {self.session.id} but no evaluations done yet"
+                )
+            self._score_received.set()       # ← wakes wait_for_recruiter_score instantly
                 
         elif command.type == CommandType.END_INTERVIEW:
-            # End interview immediately
-            logger.info(f"Recruiter ended interview {self.session.id}")
+            # Fire both events to unblock any waiting loop immediately,
+            # then spawn end_interview as background task
+            self._pending_decision = {"type": "end"}
             self.running = False
-            await self.end_interview(reason="recruiter_ended")
+            self._decision_received.set()    # ← unblocks wait_for_recruiter_decision
+            self._score_received.set()       # ← unblocks wait_for_recruiter_score if mid-wait
+            logger.info(f"Recruiter ended interview {self.session.id}")
+            asyncio.create_task(self.end_interview(reason="recruiter_ended"))
             
         elif command.type == CommandType.PAUSE_INTERVIEW:
             # Pause interview
@@ -381,15 +432,19 @@ class InterviewAgent:
             avg_score = 0
         
         # Generate comprehensive feedback
-        with Timer(f"generate_feedback_{self.session.id}"):
-            feedback = await openai_client.generate_feedback(
-                session_data={
-                    "candidate_name": self.session.candidate_name,
-                    "job_role": self.session.job_role,
-                    "company": self.session.company
-                },
-                scores=[s.model_dump() for s in self.session.scores]
-            )
+        try:
+            with Timer(f"generate_feedback_{self.session.id}"):
+                feedback = await openai_client.generate_feedback(
+                    session_data={
+                        "candidate_name": self.session.candidate_name,
+                        "job_role": self.session.job_role,
+                        "company": self.session.company
+                    },
+                    scores=[s.model_dump() for s in self.session.scores]
+                )
+        except Exception as e:
+            logger.error(f"Failed to generate feedback for {self.session.id}: {e}")
+            feedback = "Feedback generation was not available."
         
         # Send farewell message
         farewell = Message(
@@ -404,7 +459,12 @@ class InterviewAgent:
         )
         
         self.session.conversation_history.append(farewell)
-        self.session.status = InterviewStatus.COMPLETED if reason == "completed" else InterviewStatus.FAILED
+        # Map all valid end reasons to COMPLETED
+        completed_reasons = {"completed", "recruiter_ended", "timeout"}
+        self.session.status = (
+            InterviewStatus.COMPLETED if reason in completed_reasons
+            else InterviewStatus.FAILED
+        )
         self.session.end_time = datetime.utcnow()
         
         # Get metrics summary
@@ -434,6 +494,14 @@ class InterviewAgent:
         })
         
         self.running = False
+        
+        # Remove self from pod's active_interviews so pod capacity is freed
+        if self._pod and self.session.id in self._pod.active_interviews:
+            del self._pod.active_interviews[self.session.id]
+            logger.info(
+                f"Interview {self.session.id} removed from pod {self._pod.pod_id}. "
+                f"Active: {len(self._pod.active_interviews)}"
+            )
     
     async def notify_recruiter(self, update: dict):
         """Send update to recruiter via RabbitMQ"""
@@ -483,6 +551,7 @@ class InterviewPod:
         
         # Create and start agent
         agent = InterviewAgent(session)
+        agent._pod = self      # back-reference so agent can remove itself from pod on end
         self.active_interviews[session.id] = agent
         
         # Start interview

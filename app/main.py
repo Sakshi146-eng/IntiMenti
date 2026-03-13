@@ -7,18 +7,18 @@ import logging
 import time
 import uuid
 
-from config import settings, get_settings
-from models import (
+from core.config import settings, get_settings
+from database.models import (
     InterviewSessionCreate, InterviewSession, 
     RecruiterCommand, CandidateResponse, PodHealth,
     SystemStats
 )
-from database import redis_client, postgres_client
-from rabbitmq import rabbitmq_client
-from orchestrator import orchestrator
-from telegram_bot import telegram_bot
-from exceptions import InterviewSystemException, http_exception_from_system_exception
-from middleware import setup_middleware
+from database.database import redis_client, postgres_client
+from messaging.rabbitmq import rabbitmq_client
+from services.orchestrator import orchestrator
+from integrations.telegram_bot import telegram_bot
+from core.exceptions import InterviewSystemException, http_exception_from_system_exception
+from core.middleware import setup_middleware
 from utils import Timer
 
 # Configure logging

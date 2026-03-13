@@ -1,8 +1,8 @@
 import logging
 import asyncio
 from typing import Optional, Dict, Any
-from config import settings
-from rabbitmq import rabbitmq_client
+from core.config import settings
+from messaging.rabbitmq import rabbitmq_client
 
 logger = logging.getLogger(__name__)
 
@@ -114,22 +114,33 @@ class TelegramBot:
             reasoning = message.get("reasoning", "")
             answer = message.get("answer", "")[:200]
             followup = message.get("suggested_followup", "")
+            q_num = message.get("question_number", 0)
             text = (
                 f"✅ *Response Evaluated* — *{candidate}*\n"
-                f"Session: `{short_id}`\n\n"
+                f"Session: `{short_id}` | Q{q_num}\n\n"
                 f"📊 AI Score: *{score}/10*\n"
                 f"💬 Answer: _{answer}_\n\n"
                 f"🧠 Reasoning: {reasoning[:200]}"
             )
-            if message.get("should_ask_followup") and followup:
-                text += (
-                    f"\n\n💡 *Suggested Follow-up:*\n_{followup}_\n\n"
-                    f"Reply with:\n"
-                    f"`/accept {short_id}` — Ask AI's followup\n"
-                    f"`/custom {short_id} your question` — Ask your own\n"
-                    f"`/end {short_id}` — End interview\n"
-                    f"`/score {short_id} 8 Great answer` — Score + feedback"
-                )
+            # Always prompt for recruiter score
+            text += (
+                f"\n\n📋 *Your turn — rate this answer:*\n"
+                f"`/score {short_id} <0-10>`"
+            )
+            # After Q3, show followup and decision options
+            if q_num > 3:
+                if followup:
+                    text += (
+                        f"\n\n💡 *Suggested Follow-up:*\n"
+                        f"_{followup}_\n\n"
+                        f"👇 Press *Accept Followup* to ask this question,\n"
+                        f"or type `/custom {short_id} your question` to ask your own."
+                    )
+                else:
+                    text += (
+                        f"\n\nType `/custom {short_id} your question` to ask your own,\n"
+                        f"or press *End Interview* to finish."
+                    )
             return text
         
         elif update_type == "INTERVIEW_COMPLETED":
@@ -152,12 +163,14 @@ class TelegramBot:
             return f"ℹ️ *{update_type}* — Session: `{short_id}`"
     
     def _build_keyboard(self, message: dict) -> Optional[dict]:
-        """Build inline keyboard for recruiter actions"""
+        """Build inline keyboard for recruiter actions.
+        Only shows decision buttons after the first 3 questions."""
         update_type = message.get("type", "")
         session_id = message.get("session_id", "")
-        short_id = session_id[:8] if session_id else ""
+        q_num = message.get("question_number", 0)
         
-        if update_type == "RESPONSE_EVALUATED" and message.get("should_ask_followup"):
+        # Show inline buttons only after Q3 (first 3 fixed questions)
+        if update_type == "RESPONSE_EVALUATED" and q_num > 3:
             return {
                 "inline_keyboard": [
                     [
@@ -246,7 +259,7 @@ class TelegramBot:
                     "`/accept <id>` — Accept AI's suggested followup\n"
                     "`/custom <id> <your question>` — Ask your own question\n"
                     "`/end <id>` — End the interview\n"
-                    "`/score <id> <0-10> <feedback>` — Give your score\n\n"
+                    "`/score <id> <0-10>` — Give your score\n\n"
                     "You can use the first 8 chars of the session ID."
                 )
             elif text.startswith("/accept"):
@@ -282,10 +295,12 @@ class TelegramBot:
             )
             await self._answer_callback(callback_query["id"], "✅ Followup accepted!")
         elif action == "end":
-            await self._send_recruiter_command(
-                session_id, chat_id, "end_interview"
+            # Spawn as background task so answerCallbackQuery returns immediately
+            asyncio.create_task(
+                self._send_recruiter_command(session_id, chat_id, "end_interview")
             )
-            await self._answer_callback(callback_query["id"], "❌ Interview ended!")
+            await self._answer_callback(callback_query["id"], "❌ Interview ending...")
+            await self._send_message(chat_id, f"🚩 Ending interview `{session_id[:8]}`...")
     
     async def _handle_accept(self, chat_id: str, text: str):
         """Handle /accept command"""
@@ -323,9 +338,9 @@ class TelegramBot:
     
     async def _handle_score(self, chat_id: str, text: str):
         """Handle /score command"""
-        parts = text.split(maxsplit=3)
+        parts = text.split(maxsplit=2)
         if len(parts) < 3:
-            await self._send_message(chat_id, "Usage: `/score <session_id> <0-10> [feedback]`")
+            await self._send_message(chat_id, "Usage: `/score <session_id> <0-10>`")
             return
         
         session_id = parts[1]
@@ -337,15 +352,13 @@ class TelegramBot:
             await self._send_message(chat_id, "❌ Score must be a number between 0 and 10")
             return
         
-        feedback = parts[3] if len(parts) > 3 else None
         await self._send_recruiter_command(
-            session_id, chat_id, "accept_followup",
-            recruiter_score=score, recruiter_feedback=feedback
+            session_id, chat_id, "score_submitted",
+            recruiter_score=score
         )
         await self._send_message(
             chat_id,
-            f"📊 Score {score}/10 recorded for session `{session_id[:8]}`"
-            + (f"\n💬 Feedback: {feedback}" if feedback else "")
+            f"📊 Score *{score}/10* recorded for session `{session_id[:8]}`"
         )
     
     async def _send_recruiter_command(

@@ -25,6 +25,7 @@ class CommandType(str, Enum):
     END_INTERVIEW = "end_interview"
     ACCEPT_FOLLOWUP = "accept_followup"
     CUSTOM_FOLLOWUP = "custom_followup"
+    SCORE_SUBMITTED = "score_submitted"     # Recruiter submitted score/feedback
     PAUSE_INTERVIEW = "pause_interview"
     RESUME_INTERVIEW = "resume_interview"
     REQUEST_SUMMARY = "request_summary"

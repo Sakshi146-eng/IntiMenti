@@ -2,11 +2,12 @@ import openai
 from openai import AsyncOpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 from typing import List, Dict, Any, Optional
+import asyncio
 import json
 import logging
 import tiktoken
-from config import settings
-from exceptions import OpenAIError
+from core.config import settings
+from core.exceptions import OpenAIError
 from utils import Timer
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,10 @@ class OpenAIClient:
             
             return content
             
+        except asyncio.CancelledError:
+            # Do not retry on cancellation — re-raise immediately
+            logger.warning("LLM completion was cancelled")
+            raise
         except openai.APIError as e:
             logger.error(f"LLM API error: {e}")
             raise OpenAIError(f"LLM API error: {str(e)}", original_error=e)

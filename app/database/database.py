@@ -5,9 +5,9 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
-from config import settings
-from models import InterviewSession
-from exceptions import SessionNotFoundError
+from core.config import settings
+from database.models import InterviewSession
+from core.exceptions import SessionNotFoundError
 
 logger = logging.getLogger(__name__)
 

@@ -4,7 +4,7 @@ from typing import Callable, Optional, Dict, Any
 import json
 import logging
 import asyncio
-from config import settings
+from core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -87,10 +87,18 @@ class RabbitMQClient:
             
             # Start consuming
             async def process_message(message: aio_pika.IncomingMessage):
-                async with message.process():
+                async with message.process(ignore_processed=True):
                     try:
                         body = json.loads(message.body.decode())
                         await callback(body)
+                    except asyncio.CancelledError:
+                        # A CancelledError (e.g. from LLM httpx client being cancelled)
+                        # must NOT escape the context manager — it would corrupt the channel.
+                        logger.warning(
+                            f"Message processing was cancelled for queue '{queue_name}'. "
+                            "Message will be nacked and requeued."
+                        )
+                        await message.nack(requeue=True)
                     except json.JSONDecodeError:
                         logger.error(f"Invalid JSON in message from {queue_name}")
                     except Exception as e:

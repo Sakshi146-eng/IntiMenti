@@ -71,6 +71,8 @@ class Settings(BaseSettings):
     REDIS_TTL: int = 7200  # 2 hours
     MAX_QUESTIONS_PER_INTERVIEW: int = 15
     INTERVIEW_TIMEOUT_MINUTES: int = 60
+    RECRUITER_SCORE_TIMEOUT: int = 600     # 10 min — how long to wait for recruiter score
+    RECRUITER_DECISION_TIMEOUT: int = 600  # 10 min — how long to wait for recruiter decision
     
     # Telegram
     TELEGRAM_BOT_TOKEN: Optional[str] = None
